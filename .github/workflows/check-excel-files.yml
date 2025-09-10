@@ -1,36 +1,246 @@
-# This is a basic workflow to help you get started with Actions
+# Complete GitHub Action for Excel File Comparison
+# Place this file as .github/workflows/excel-diff.yml
 
-name: CI
+name: Excel File Comparison
 
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
   push:
-    branches: [ "main" ]
+    paths:
+      - '**.xlsx'
+      - '**.xls'
+      - '**.xlsm'
   pull_request:
-    branches: [ "main" ]
+    paths:
+      - '**.xlsx'
+      - '**.xls' 
+      - '**.xlsm'
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
-
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  excel-diff:
     runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
-
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
-
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          pip install pandas openpyxl datacompy xlsxwriter
+      
+      - name: Get changed Excel files
+        id: changed-files
+        uses: tj-actions/changed-files@v44
+        with:
+          files: |
+            **.xlsx
+            **.xls
+            **.xlsm
+          separator: ","
+      
+      - name: Create Excel comparison script
+        if: steps.changed-files.outputs.any_changed == 'true'
+        run: |
+          cat > excel_diff.py << 'EOF'
+          import pandas as pd
+          import os
+          import sys
+          import subprocess
+          from pathlib import Path
+          import json
+
+          def get_file_at_commit(filepath, commit_hash):
+              """Get file content at specific commit"""
+              try:
+                  result = subprocess.run(
+                      ['git', 'show', f'{commit_hash}:{filepath}'],
+                      capture_output=True,
+                      check=True
+                  )
+                  # Save temporary file
+                  temp_path = f"temp_{commit_hash}_{Path(filepath).name}"
+                  with open(temp_path, 'wb') as f:
+                      f.write(result.stdout)
+                  return temp_path
+              except subprocess.CalledProcessError:
+                  return None
+
+          def compare_excel_files(old_file, new_file, output_file):
+              """Compare two Excel files and generate diff report"""
+              try:
+                  # Read all sheets from both files
+                  old_sheets = pd.read_excel(old_file, sheet_name=None, engine='openpyxl')
+                  new_sheets = pd.read_excel(new_file, sheet_name=None, engine='openpyxl')
+                  
+                  changes_summary = []
+                  total_changes = 0
+                  
+                  # Compare each sheet
+                  all_sheets = set(old_sheets.keys()) | set(new_sheets.keys())
+                  
+                  with pd.ExcelWriter(output_file, engine='xlsxwriter') as writer:
+                      workbook = writer.book
+                      
+                      # Format for highlighting changes
+                      changed_format = workbook.add_format({
+                          'bg_color': '#FFCCCC',
+                          'border': 1
+                      })
+                      
+                      for sheet_name in sorted(all_sheets):
+                          if sheet_name not in old_sheets:
+                              changes_summary.append(f"➕ Sheet '{sheet_name}': Added")
+                              total_changes += 1
+                              continue
+                          elif sheet_name not in new_sheets:
+                              changes_summary.append(f"➖ Sheet '{sheet_name}': Removed")
+                              total_changes += 1
+                              continue
+                          
+                          old_df = old_sheets[sheet_name]
+                          new_df = new_sheets[sheet_name]
+                          
+                          if old_df.equals(new_df):
+                              changes_summary.append(f"✅ Sheet '{sheet_name}': No changes")
+                              continue
+                          
+                          if old_df.shape != new_df.shape:
+                              changes_summary.append(
+                                  f"📏 Sheet '{sheet_name}': Shape changed {old_df.shape} → {new_df.shape}"
+                              )
+                              total_changes += 1
+                              continue
+                          
+                          # Find cell-level differences
+                          comparison = old_df.values == new_df.values
+                          rows, cols = pd.DataFrame(comparison).stack()[lambda x: x == False].index.tolist()
+                          
+                          if rows:
+                              cell_changes = len(rows)
+                              total_changes += cell_changes
+                              changes_summary.append(
+                                  f"📝 Sheet '{sheet_name}': {cell_changes} cell changes"
+                              )
+                              
+                              # Create diff dataframe
+                              diff_df = old_df.copy()
+                              for (row, col) in rows:
+                                  old_val = old_df.iloc[row, col]
+                                  new_val = new_df.iloc[row, col] 
+                                  diff_df.iloc[row, col] = f"{old_val} → {new_val}"
+                              
+                              # Save diff sheet
+                              diff_df.to_excel(writer, sheet_name=f'DIFF_{sheet_name}', index=False)
+                  
+                  return changes_summary, total_changes
+                  
+              except Exception as e:
+                  return [f"Error comparing files: {str(e)}"], 0
+
+          def main():
+              if len(sys.argv) != 2:
+                  print("Usage: python excel_diff.py <changed_files_csv>")
+                  sys.exit(1)
+              
+              changed_files = sys.argv[1].split(',')
+              results = {}
+              
+              for filepath in changed_files:
+                  filepath = filepath.strip()
+                  if not filepath:
+                      continue
+                      
+                  print(f"Processing {filepath}...")
+                  
+                  # Get file at previous commit
+                  prev_commit = subprocess.run(['git', 'rev-parse', 'HEAD^'], 
+                                             capture_output=True, text=True).stdout.strip()
+                  
+                  old_file = get_file_at_commit(filepath, prev_commit)
+                  if not old_file:
+                      results[filepath] = ["➕ New file added"], 1
+                      continue
+                  
+                  # Compare files
+                  output_file = f"diff_{Path(filepath).stem}.xlsx"
+                  changes_summary, total_changes = compare_excel_files(
+                      old_file, filepath, output_file
+                  )
+                  
+                  results[filepath] = changes_summary, total_changes
+                  
+                  # Cleanup temp file
+                  if os.path.exists(old_file):
+                      os.remove(old_file)
+              
+              # Output results as JSON for GitHub Actions
+              with open('excel_changes.json', 'w') as f:
+                  json.dump(results, f, indent=2)
+              
+              # Create markdown summary
+              with open('excel_summary.md', 'w') as f:
+                  f.write("# 📊 Excel Files Changes Summary\n\n")
+                  
+                  for filepath, (changes, count) in results.items():
+                      f.write(f"## 📁 `{filepath}`\n\n")
+                      if count > 0:
+                          f.write(f"**{count} changes detected**\n\n")
+                      else:
+                          f.write("**No changes**\n\n")
+                      
+                      for change in changes:
+                          f.write(f"- {change}\n")
+                      f.write("\n")
+
+          if __name__ == "__main__":
+              main()
+          EOF
+      
+      - name: Run Excel comparison
+        if: steps.changed-files.outputs.any_changed == 'true'
+        run: |
+          python excel_diff.py "${{ steps.changed-files.outputs.all_changed_files }}"
+      
+      - name: Upload diff results
+        if: steps.changed-files.outputs.any_changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: excel-diff-results
+          path: |
+            diff_*.xlsx
+            excel_changes.json
+            excel_summary.md
+      
+      - name: Comment on PR with results
+        if: github.event_name == 'pull_request' && steps.changed-files.outputs.any_changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            if (fs.existsSync('excel_summary.md')) {
+              const summary = fs.readFileSync('excel_summary.md', 'utf8');
+              
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: summary
+              });
+            }
+      
+      - name: Output changes for other workflows
+        if: steps.changed-files.outputs.any_changed == 'true'
+        run: |
+          echo "excel-files-changed=true" >> $GITHUB_OUTPUT
+          cat excel_summary.md
